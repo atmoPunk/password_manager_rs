@@ -1,0 +1,13 @@
+[package]
+name = "password_manager_rs"
+version = "0.1.0"
+authors = ["Ivanov Dmitry <atmopunk@outlook.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+argonautica = { version = "0.2.0", features = ["serde", "simd"] }
+toml = "0.5"
+clap = "2.33.0"
+serde = { version = "1.0", features = ["derive"] }
