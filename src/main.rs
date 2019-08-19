@@ -4,7 +4,11 @@ extern crate toml;
 extern crate serde;
 extern crate twofish;
 extern crate block_modes;
+extern crate termion;
 
+
+use termion::input::TermRead;
+use std::io::{stdin, stdout};
 use argonautica::{Hasher, Verifier};
 use clap::{App, Arg, SubCommand};
 use std::fs::File;
@@ -49,6 +53,10 @@ impl PasswordDatabase {
                 self.passwords = Some(hm);
             }
         }
+    }
+    
+    fn delete(&mut self, id: &str) {
+        unimplemented!();
     }
 }
 
@@ -100,6 +108,7 @@ impl Error for PasswordError {
     }
 }
 
+
 fn open_db(db: &str, pw: &str) -> Result<PasswordDatabase, Box<dyn Error>> {
     let mut file = File::open(db)?;
     let mut bytes: Vec<u8> = Default::default();
@@ -118,9 +127,76 @@ fn open_db(db: &str, pw: &str) -> Result<PasswordDatabase, Box<dyn Error>> {
     }
 }
 
+// TODO: add writing again
+
+fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>> {
+    let mut buffer = String::new();
+    print!("{}", menu_string());
+    
+    loop {
+        stdin().read_line(&mut buffer)?;
+        println!("buffer is {:?}", buffer);
+        let option = buffer.trim().parse::<i32>()?;
+        buffer.clear();
+        println!("option is {}", option);
+        match option {
+            0 => break,
+            1 => {
+                let (id, pw) = read_entry()?;
+                let cipher_pw = password_encrypt(&id, &pw, db_pw);
+                db.add(id.to_owned(), cipher_pw);
+                println!("DB is now {:?}", db);
+            },
+            2 => {
+                let mut id = String::new();
+                stdin().read_line(&mut id)?;
+                id = id.trim().to_owned();
+                match db.get(&id) {
+                    Some(enc_pw) => {
+                        let dec_pw = password_decrypt(&id, &enc_pw, db_pw);
+                        println!("{}:\n{}", id, dec_pw);
+                    },
+                    None => {
+                        println!("password with id \"{}\" not found", id);
+                    }
+                }
+            }
+            3 => {
+                let mut id = String::new();
+                stdin().read_line(&mut id)?;
+                db.delete(&id);
+            }
+            _ => ()
+        }
+        print!("{}", menu_string());
+    }
+    Ok(())
+}
+
+fn read_entry() -> Result<(String, String), Box<dyn Error>> {
+    let stdout = stdout();
+    let mut stdout = stdout.lock();
+
+    let stdin = stdin();
+    let mut stdin = stdin.lock();
+
+    let id = TermRead::read_line(&mut stdin)?.unwrap();
+    let pass = stdin.read_passwd(&mut stdout)?.unwrap();
+    println!("Password read!");
+
+    Ok((id, pass))
+}
+
+fn menu_string() -> String {
+    format!("1 - Add an entry\r\n\
+             2 - View an entry\r\n\
+             3 - Delete an entry\r\n\
+             0 - Exit\r\n")
+} 
+
 fn main() {
     let matches = App::new("Password Manager")
-                        .version("0.0")
+                        .version("0.1")
                         .author("Dmitriy I. <atmopunk@outlook.com>")
                         .about("Stores passwords")
                         .subcommand(SubCommand::with_name("create")
@@ -142,23 +218,23 @@ fn main() {
                             .arg(Arg::with_name("PASSWORD")
                                 .help("Password to open database with")
                                 .required(true)
-                                .index(2))
-                            .subcommand(SubCommand::with_name("add")
-                                .about("add a password to database")
-                                .arg(Arg::with_name("PASSWORD_ID")
-                                    .help("login/site name/whatever")
-                                    .required(true)
-                                    .index(1))
-                                .arg(Arg::with_name("NEW_PASSWORD")
-                                    .help("password to add")
-                                    .required(true)
-                                    .index(2)))
-                            .subcommand(SubCommand::with_name("get")
-                                .about("get a password from database")
-                                .arg(Arg::with_name("PASSWORD_ID")
-                                    .help("login/site name/whatever")
-                                    .required(true)
-                                    .index(1))))
+                                .index(2)) )
+                            // .subcommand(SubCommand::with_name("add")
+                            //     .about("add a password to database")
+                            //     .arg(Arg::with_name("PASSWORD_ID")
+                            //         .help("login/site name/whatever")
+                            //         .required(true)
+                            //         .index(1))
+                            //     .arg(Arg::with_name("NEW_PASSWORD")
+                            //         .help("password to add")
+                            //         .required(true)
+                            //         .index(2)))
+                            // .subcommand(SubCommand::with_name("get")
+                            //     .about("get a password from database")
+                            //     .arg(Arg::with_name("PASSWORD_ID")
+                            //         .help("login/site name/whatever")
+                            //         .required(true)
+                            //         .index(1))))
                         .get_matches();
 
     match matches.subcommand() {
@@ -185,32 +261,33 @@ fn main() {
             let db_path = open_matches.value_of("DATABASE").unwrap();
             let db_password = open_matches.value_of("PASSWORD").unwrap();
             let mut db = open_db(db_path, db_password).unwrap();
-            match open_matches.subcommand() {
-                ("add", add_matches) => {
-                    let add_matches = add_matches.unwrap();
-                    let pw_id = add_matches.value_of("PASSWORD_ID").unwrap();
-                    let new_pw = add_matches.value_of("NEW_PASSWORD").unwrap();
-                    let cipher_pw = password_encrypt(pw_id, new_pw, db_password);
-                    db.add(pw_id.to_owned(), cipher_pw);
-                    let toml = toml::to_string(&db).unwrap();
-                    let mut db_file = File::create(db_path).expect("Can't create a database file");
-                    db_file.write_all(toml.as_bytes()).unwrap();
-                },
-                ("get", get_matches) => {
-                    let get_matches = get_matches.unwrap();
-                    let pw_id = get_matches.value_of("PASSWORD_ID").unwrap();
-                    match db.get(pw_id) {
-                        Some(enc_pw) => {
-                            let dec_pw = password_decrypt(pw_id, &enc_pw, db_password);
-                            println!("{}:\n{}", pw_id, dec_pw);
-                        },
-                        None => {
-                            println!("password with id \"{}\" not found", pw_id);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            db_menu(&mut db, db_password).unwrap();
+            // match open_matches.subcommand() {
+            //     ("add", add_matches) => {
+            //         let add_matches = add_matches.unwrap();
+            //         let pw_id = add_matches.value_of("PASSWORD_ID").unwrap();
+            //         let new_pw = add_matches.value_of("NEW_PASSWORD").unwrap();
+            //         let cipher_pw = password_encrypt(pw_id, new_pw, db_password);
+            //         db.add(pw_id.to_owned(), cipher_pw);
+            //         let toml = toml::to_string(&db).unwrap();
+            //         let mut db_file = File::create(db_path).expect("Can't create a database file");
+            //         db_file.write_all(toml.as_bytes()).unwrap();
+            //     },
+            //     ("get", get_matches) => {
+            //         let get_matches = get_matches.unwrap();
+            //         let pw_id = get_matches.value_of("PASSWORD_ID").unwrap();
+            //         match db.get(pw_id) {
+            //             Some(enc_pw) => {
+            //                 let dec_pw = password_decrypt(pw_id, &enc_pw, db_password);
+            //                 println!("{}:\n{}", pw_id, dec_pw);
+            //             },
+            //             None => {
+            //                 println!("password with id \"{}\" not found", pw_id);
+            //             }
+            //         }
+            //     }
+            //     _ => {}
+            // }
         },
         _ => {}
     }
