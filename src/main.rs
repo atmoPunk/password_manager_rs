@@ -2,6 +2,8 @@ extern crate argonautica;
 extern crate clap;
 extern crate toml;
 extern crate serde;
+extern crate twofish;
+extern crate block_modes;
 
 use argonautica::{Hasher, Verifier};
 use clap::{App, Arg, SubCommand};
@@ -9,17 +11,76 @@ use std::fs::File;
 use std::io::prelude::*;
 use serde::{Serialize, Deserialize};
 use std::error::Error;
+use std::collections::HashMap;
+use block_modes::{BlockMode, Cbc};
+use block_modes::block_padding::Pkcs7;
+use std::env::var_os;
+use twofish::Twofish;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Password {
-    password_id: String,
-    password_hash: String
-}
+type TwofishCbc = Cbc<Twofish, Pkcs7>;
+type ByteVec = Vec<u8>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PasswordDatabase {
     main_hash: String,
-    passwords: Option<Vec<Password>>
+    passwords: Option<HashMap<String, ByteVec>>,
+}
+
+impl PasswordDatabase {
+    fn get(&self, id: &str) -> Option<ByteVec> {
+        match &self.passwords {
+            Some(passwords) => {
+                passwords.get(id).cloned()
+            },
+            None => {
+                None
+            }
+        }
+    }
+
+    fn add(&mut self, id: String, pw: ByteVec) {
+        match self.passwords {
+            Some(ref mut passwords) => {
+                passwords.insert(id, pw);
+            },
+            None => {
+                let mut hm = HashMap::new();
+                hm.insert(id, pw);
+                self.passwords = Some(hm);
+            }
+        }
+    }
+}
+
+fn password_encrypt(id: &str, pw: &str, db_password: &str) -> Vec<u8> {
+    let mut bytes = (id.to_owned() + var_os("USER").unwrap().to_str().unwrap()).as_bytes().to_owned();
+    while bytes.len() < 16 {
+        bytes.append(&mut bytes.clone());
+    }
+
+    let mut key = db_password.as_bytes().to_owned();
+    while key.len() < 16 {
+        key.append(&mut key.clone());
+    }
+
+    let cipher = TwofishCbc::new_var(&key[0 .. 16], &bytes[0 .. 16]).unwrap();
+    cipher.encrypt_vec(pw.as_bytes())
+}
+
+fn password_decrypt(id: &str, pw: &[u8], db_password: &str) -> String {
+    let mut bytes = (id.to_owned() + var_os("USER").unwrap().to_str().unwrap()).as_bytes().to_owned();
+    while bytes.len() < 32 {
+        bytes.append(&mut bytes.clone());
+    }
+
+    let mut key = db_password.as_bytes().to_owned();
+    while key.len() < 16 {
+        key.append(&mut key.clone());
+    }
+
+    let cipher = TwofishCbc::new_var(&key[0 .. 16], &bytes[0 .. 16]).unwrap();
+    let pw_bytes = cipher.decrypt_vec(pw).unwrap();
+    String::from_utf8(pw_bytes).unwrap()
 }
 
 #[derive(Debug)]
@@ -40,7 +101,7 @@ impl Error for PasswordError {
 }
 
 fn open_db(db: &str, pw: &str) -> Result<PasswordDatabase, Box<dyn Error>> {
-    let mut file = File::open(db.to_owned() + ".toml")?;
+    let mut file = File::open(db)?;
     let mut bytes: Vec<u8> = Default::default();
     file.read_to_end(&mut bytes)?;
     let pd: PasswordDatabase = toml::from_slice(&bytes)?;
@@ -48,7 +109,7 @@ fn open_db(db: &str, pw: &str) -> Result<PasswordDatabase, Box<dyn Error>> {
     let is_valid = verifier
                 .with_hash(pd.main_hash.clone())
                 .with_password(pw)
-                .with_secret_key("secret_key")
+                .with_secret_key(var_os("USER").unwrap().into_string().unwrap())
                 .verify().unwrap();
     if is_valid {
         Ok(pd)
@@ -83,7 +144,7 @@ fn main() {
                                 .required(true)
                                 .index(2))
                             .subcommand(SubCommand::with_name("add")
-                                .about("adds a password to database")
+                                .about("add a password to database")
                                 .arg(Arg::with_name("PASSWORD_ID")
                                     .help("login/site name/whatever")
                                     .required(true)
@@ -91,7 +152,13 @@ fn main() {
                                 .arg(Arg::with_name("NEW_PASSWORD")
                                     .help("password to add")
                                     .required(true)
-                                    .index(2))))
+                                    .index(2)))
+                            .subcommand(SubCommand::with_name("get")
+                                .about("get a password from database")
+                                .arg(Arg::with_name("PASSWORD_ID")
+                                    .help("login/site name/whatever")
+                                    .required(true)
+                                    .index(1))))
                         .get_matches();
 
     match matches.subcommand() {
@@ -101,7 +168,7 @@ fn main() {
             let password = create_matches.value_of("PASSWORD").unwrap();
             let mut hasher = Hasher::default();
             let pw_hash = hasher.with_password(password)
-                                .with_secret_key("secret_key")
+                                .with_secret_key(var_os("USER").unwrap().into_string().unwrap())
                                 .hash()
                                 .unwrap();
             let pd = PasswordDatabase {
@@ -110,7 +177,7 @@ fn main() {
             };
 
             let toml = toml::to_string(&pd).unwrap();
-            let mut db_file = File::create(db.to_owned() + ".toml").expect("Can't create a database file");
+            let mut db_file = File::create(db).expect("Can't create a database file");
             db_file.write_all(toml.as_bytes()).unwrap();
         },
         ("open", open_matches) => {
@@ -123,48 +190,28 @@ fn main() {
                     let add_matches = add_matches.unwrap();
                     let pw_id = add_matches.value_of("PASSWORD_ID").unwrap();
                     let new_pw = add_matches.value_of("NEW_PASSWORD").unwrap();
-                    let mut hasher = Hasher::default();
-                    let pw_hash = hasher.with_password(new_pw)
-                                        .with_secret_key("secret_key")
-                                        .hash()
-                                        .unwrap();
-                    match db.passwords {
-                        Some(ref mut passwords) => {
-                            passwords.push(Password { 
-                            password_id: pw_id.to_string(),
-                            password_hash: pw_hash });
-                        },
-                        None => {
-                            let mut passwords = Vec::new();
-                            passwords.push(Password { 
-                                password_id: pw_id.to_string(),
-                                password_hash: pw_hash
-                            });
-                            db.passwords = Some(passwords)
-                        }
-                    };
+                    let cipher_pw = password_encrypt(pw_id, new_pw, db_password);
+                    db.add(pw_id.to_owned(), cipher_pw);
                     let toml = toml::to_string(&db).unwrap();
-                    let mut db_file = File::create(db_path.to_owned() + ".toml").expect("Can't create a database file");
+                    let mut db_file = File::create(db_path).expect("Can't create a database file");
                     db_file.write_all(toml.as_bytes()).unwrap();
                 },
+                ("get", get_matches) => {
+                    let get_matches = get_matches.unwrap();
+                    let pw_id = get_matches.value_of("PASSWORD_ID").unwrap();
+                    match db.get(pw_id) {
+                        Some(enc_pw) => {
+                            let dec_pw = password_decrypt(pw_id, &enc_pw, db_password);
+                            println!("{}:\n{}", pw_id, dec_pw);
+                        },
+                        None => {
+                            println!("password with id \"{}\" not found", pw_id);
+                        }
+                    }
+                }
                 _ => {}
             }
         },
         _ => {}
     }
-
-    // let db = matches.value_of("DATABASE").unwrap();
-    // let mut file = File::open(db)
-
-    // let password = matches.value_of("DB PASSWORD").unwrap();
-    // let mut hasher = Hasher::default();
-    // let hash = hasher
-    //             .with_password(password)
-    //             .with_secret_key("secret_key")
-    //             .with_salt("somesalt")
-    //             .hash()
-    //             .unwrap();
-    // println!("Password is {}", password);
-    // println!("Hash is {}", hash);
-    // println!("Hello, world!");
 }
