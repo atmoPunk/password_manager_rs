@@ -39,18 +39,26 @@ impl PasswordDatabase {
         }
     }
 
-    fn add(&mut self, id: String, pw: ByteVec) {
+    fn add(&mut self, id: &str, pw: ByteVec) -> Result<(), ()> {
         match self.passwords {
             Some(ref mut passwords) => {
-                passwords.insert(id, pw);
+                match passwords.get(id) {
+                    Some(_) => Err(()),
+                    None => {
+                        passwords.insert(id.to_owned(), pw);
+                        self.write();
+                        Ok(())
+                    }
+                }
             }
             None => {
                 let mut hm = HashMap::new();
-                hm.insert(id, pw);
+                hm.insert(id.to_owned(), pw);
                 self.passwords = Some(hm);
+                self.write();
+                Ok(())
             }
         }
-        self.write();
     }
 
     fn write(&self) {
@@ -64,8 +72,34 @@ impl PasswordDatabase {
         file.write_all(toml.as_bytes()).unwrap();
     }
 
-    fn delete(&mut self, id: &str) {
-        unimplemented!();
+    fn delete(&mut self, id: &str) -> Result<(), ()> {
+        match self.passwords {
+            Some(ref mut passwords) => {
+                match passwords.remove_entry(id) {
+                    Some((_, _)) => { self.write(); Ok(()) },
+                    None => Err(())
+                }
+            },
+            None => Err(())
+        }
+        
+    }
+
+    fn edit(&mut self, id: &str, pw: ByteVec) -> Result<(), ()> {
+        match self.passwords {
+            Some(ref mut passwords) => {
+                match passwords.get(id) {
+                    Some(_) => { passwords.insert(id.to_owned(), pw); self.write(); Ok(()) },
+                    None => {
+                        Err(())
+                    }
+                }
+            }
+
+            None => {
+                Err(())
+            }
+        }
     }
 }
 
@@ -155,26 +189,56 @@ fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>>
             1 => {
                 let (id, pw) = read_entry()?;
                 let cipher_pw = password_encrypt(&id, &pw, db_pw);
-                db.add(id.to_owned(), cipher_pw);
+                match db.add(&id, cipher_pw) {
+                    Ok(_) => {
+                        println!("Added successfully");
+                    },
+                    Err(_) => {
+                        println!("Entry with id {} already exists", id);
+                    }
+                }
+                
             }
             2 => {
+                print!("login: ");
+                stdout().flush().unwrap();
                 let mut id = String::new();
                 stdin().read_line(&mut id)?;
                 id = id.trim().to_owned();
                 match db.get(&id) {
                     Some(enc_pw) => {
                         let dec_pw = password_decrypt(&id, &enc_pw, db_pw);
-                        println!("login: {}\npassword: {}", id, dec_pw);
-                    }
+                        println!("password: {}", dec_pw);
+                    },
                     None => {
-                        println!("password with id \"{}\" not found", id);
+                        println!("Entry not found");
                     }
                 }
             }
             3 => {
                 let mut id = String::new();
                 stdin().read_line(&mut id)?;
-                db.delete(&id);
+                match db.delete(&id) {
+                    Ok(_) => {
+                        println!("Entry deleted successfully");
+                    },
+                    Err(_) => {
+                        println!("Entry not found");
+                    }
+                }
+            }
+            4 => {
+                let (id, pw) = read_entry()?;
+                let cipher_pw = password_encrypt(&id, &pw, db_pw);
+                match db.edit(&id, cipher_pw) {
+                    Ok(_) => {
+                        println!("Edited successfully");
+                    },
+                    Err(_) => {
+                        println!("Entry with id {} not found", id);
+                    }
+                }
+
             }
             _ => (),
         }
@@ -183,18 +247,35 @@ fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn read_entry() -> Result<(String, String), Box<dyn Error>> {
-    let stdout = stdout();
-    let mut stdout = stdout.lock();
-
+fn read_password() -> Result<String, Box<dyn Error>> {
     let stdin = stdin();
     let mut stdin = stdin.lock();
 
-    print!("login: ");
-    let id = TermRead::read_line(&mut stdin)?.unwrap();
-    print!("password: ");
+    let stdout = stdout();
+    let mut stdout = stdout.lock();
+    
     let pass = stdin.read_passwd(&mut stdout)?.unwrap();
+    Ok(pass)
+}
 
+fn read_entry() -> Result<(String, String), Box<dyn Error>> {
+    let id;
+    let pass;
+    
+    {
+        let stdin = stdin();
+        let mut stdin = stdin.lock();
+
+        print!("login: ");
+        stdout().flush().unwrap();
+        id = TermRead::read_line(&mut stdin)?.unwrap();
+    }
+    {
+        print!("password: ");
+        stdout().flush().unwrap();
+        pass = read_password()?;
+        println!("");
+    }
     Ok((id, pass))
 }
 
@@ -203,6 +284,7 @@ fn menu_string() -> String {
         "1 - Add an entry\r\n\
          2 - View an entry\r\n\
          3 - Delete an entry\r\n\
+         4 - Edit an entry\r\n\
          0 - Exit\r\n",
     )
 }
@@ -213,19 +295,13 @@ fn main() {
         .author("Dmitriy I. <atmopunk@outlook.com>")
         .about("Stores passwords")
         .subcommand(
-            SubCommand::with_name("create")
+            SubCommand::with_name("new")
                 .about("creates a new password database")
                 .arg(
                     Arg::with_name("DATABASE")
                         .help("File in which passwords are stored")
                         .required(true)
                         .index(1),
-                )
-                .arg(
-                    Arg::with_name("PASSWORD")
-                        .help("Password to lock database with")
-                        .required(true)
-                        .index(2),
                 ),
         )
         .subcommand(
@@ -236,21 +312,32 @@ fn main() {
                         .help("File in which passwords are stored")
                         .required(true)
                         .index(1),
-                )
-                .arg(
-                    Arg::with_name("PASSWORD")
-                        .help("Password to open database with")
-                        .required(true)
-                        .index(2),
                 ),
         )
         .get_matches();
 
     match matches.subcommand() {
-        ("create", create_matches) => {
+        ("new", create_matches) => {
             let create_matches = create_matches.unwrap();
             let db = create_matches.value_of("DATABASE").unwrap();
-            let password = create_matches.value_of("PASSWORD").unwrap();
+
+            let mut password;
+            loop {
+                print!("password: ");
+                stdout().flush().unwrap();
+                password = read_password().unwrap();
+                print!("\npassword again: ");
+                stdout().flush().unwrap();
+                let password_re = read_password().unwrap();
+                println!("");
+
+                if password == password_re {
+                    break;
+                } else {
+                    println!("Passwords do not match");
+                }
+            }
+            
             let mut hasher = Hasher::default();
             let pw_hash = hasher
                 .with_password(password)
@@ -279,9 +366,19 @@ fn main() {
         ("open", open_matches) => {
             let open_matches = open_matches.unwrap();
             let db_path = open_matches.value_of("DATABASE").unwrap();
-            let db_password = open_matches.value_of("PASSWORD").unwrap();
-            let mut db = open_db(db_path, db_password).unwrap();
-            db_menu(&mut db, db_password).unwrap();
+            print!("password: ");
+            stdout().flush().unwrap();
+            let db_password = read_password().unwrap();
+            println!("");
+
+            match open_db(db_path, &db_password) {
+                Ok(mut db) => {
+                    db_menu(&mut db, &db_password).unwrap();
+                },
+                Err(_) => {
+                    println!("Wrong password");
+                }
+            }
         }
         _ => {}
     }
