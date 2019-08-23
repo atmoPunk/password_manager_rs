@@ -5,175 +5,69 @@ extern crate serde;
 extern crate termion;
 extern crate toml;
 extern crate twofish;
+extern crate rand;
 
-use argonautica::{Hasher, Verifier};
+mod password_database;
+
+use password_database::PasswordDatabase;
+use argonautica::Hasher;
 use block_modes::block_padding::Pkcs7;
 use block_modes::{BlockMode, Cbc};
 use clap::{App, Arg, SubCommand};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env::var_os;
 use std::error::Error;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::prelude::*;
 use std::io::{stdin, stdout};
 use std::path::PathBuf;
 use termion::input::TermRead;
 use twofish::Twofish;
+use rand::prelude::*;
+
 
 type TwofishCbc = Cbc<Twofish, Pkcs7>;
-type ByteVec = Vec<u8>;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PasswordDatabase {
-    main_hash: String,
-    path: PathBuf,
-    passwords: Option<HashMap<String, ByteVec>>,
-}
-
-impl PasswordDatabase {
-    fn get(&self, id: &str) -> Option<ByteVec> {
-        match &self.passwords {
-            Some(passwords) => passwords.get(id).cloned(),
-            None => None,
-        }
+fn create_password() -> String {
+    let acceptable_characters = "abcdefghijklmnopqrstuvwxyz\
+                                ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                                01234567890!$%^*.+-";
+    let mut rng = thread_rng(); // Probably good enough
+    let mut pass = String::new();
+    for _ in 0 .. 18 { // Maybe make length variable
+        pass.push(acceptable_characters.chars().choose(&mut rng).unwrap());
     }
-
-    fn add(&mut self, id: &str, pw: ByteVec) -> Result<(), ()> {
-        match self.passwords {
-            Some(ref mut passwords) => {
-                match passwords.get(id) {
-                    Some(_) => Err(()),
-                    None => {
-                        passwords.insert(id.to_owned(), pw);
-                        self.write();
-                        Ok(())
-                    }
-                }
-            }
-            None => {
-                let mut hm = HashMap::new();
-                hm.insert(id.to_owned(), pw);
-                self.passwords = Some(hm);
-                self.write();
-                Ok(())
-            }
-        }
-    }
-
-    fn write(&self) {
-        let toml = toml::to_string(self).expect("Cant convert to toml");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(self.path.clone())
-            .unwrap(); // TODO: do not rewrite file every time
-        file.write_all(toml.as_bytes()).unwrap();
-    }
-
-    fn delete(&mut self, id: &str) -> Result<(), ()> {
-        match self.passwords {
-            Some(ref mut passwords) => {
-                match passwords.remove_entry(id) {
-                    Some((_, _)) => { self.write(); Ok(()) },
-                    None => Err(())
-                }
-            },
-            None => Err(())
-        }
-        
-    }
-
-    fn edit(&mut self, id: &str, pw: ByteVec) -> Result<(), ()> {
-        match self.passwords {
-            Some(ref mut passwords) => {
-                match passwords.get(id) {
-                    Some(_) => { passwords.insert(id.to_owned(), pw); self.write(); Ok(()) },
-                    None => {
-                        Err(())
-                    }
-                }
-            }
-
-            None => {
-                Err(())
-            }
-        }
-    }
+    pass
 }
 
 fn password_encrypt(id: &str, pw: &str, db_password: &str) -> Vec<u8> {
-    let mut bytes = (id.to_owned() + var_os("USER").unwrap().to_str().unwrap())
-        .as_bytes()
-        .to_owned();
+    let mut bytes = id.as_bytes().to_owned();
     while bytes.len() < 16 {
-        bytes.append(&mut bytes.clone());
+        bytes.push(0);
     }
 
     let mut key = db_password.as_bytes().to_owned();
     while key.len() < 16 {
-        key.append(&mut key.clone());
+        key.push(0);
     }
 
-    let cipher = TwofishCbc::new_var(&key[0..16], &bytes[0..16]).unwrap();
+    let cipher = TwofishCbc::new_var(&key, &bytes).unwrap(); // TODO: Max key length is only 16 - need to fix it
     cipher.encrypt_vec(pw.as_bytes())
 }
 
 fn password_decrypt(id: &str, pw: &[u8], db_password: &str) -> String {
-    let mut bytes = (id.to_owned() + var_os("USER").unwrap().to_str().unwrap())
-        .as_bytes()
-        .to_owned();
-    while bytes.len() < 32 {
-        bytes.append(&mut bytes.clone());
+    let mut bytes = id.as_bytes().to_owned();
+    while bytes.len() < 16 {
+        bytes.push(0);
     }
 
     let mut key = db_password.as_bytes().to_owned();
     while key.len() < 16 {
-        key.append(&mut key.clone());
+        key.push(0);
     }
 
-    let cipher = TwofishCbc::new_var(&key[0..16], &bytes[0..16]).unwrap();
+    let cipher = TwofishCbc::new_var(&key, &bytes).unwrap();
     let pw_bytes = cipher.decrypt_vec(pw).unwrap();
     String::from_utf8(pw_bytes).unwrap()
-}
-
-#[derive(Debug)]
-struct PasswordError {
-    password: String,
-}
-
-impl std::fmt::Display for PasswordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Password Error {}", self.password)
-    }
-}
-
-impl Error for PasswordError {
-    fn description(&self) -> &str {
-        "Wrong password"
-    }
-}
-
-fn open_db(db: &str, pw: &str) -> Result<PasswordDatabase, Box<dyn Error>> {
-    let mut file = File::open(db)?;
-    let mut bytes: Vec<u8> = Default::default();
-    file.read_to_end(&mut bytes)?;
-    let pd: PasswordDatabase = toml::from_slice(&bytes)?;
-    let mut verifier = Verifier::default();
-    let is_valid = verifier
-        .with_hash(pd.main_hash.clone())
-        .with_password(pw)
-        .with_secret_key(var_os("USER").unwrap().into_string().unwrap())
-        .verify()
-        .unwrap();
-    if is_valid {
-        Ok(pd)
-    } else {
-        Err(Box::new(PasswordError {
-            password: pw.to_owned(),
-        }))
-    }
 }
 
 fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>> {
@@ -191,7 +85,7 @@ fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>>
                 let cipher_pw = password_encrypt(&id, &pw, db_pw);
                 match db.add(&id, cipher_pw) {
                     Ok(_) => {
-                        println!("Added successfully");
+                        println!("Entry added successfully");
                     },
                     Err(_) => {
                         println!("Entry with id {} already exists", id);
@@ -205,17 +99,35 @@ fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>>
                 let mut id = String::new();
                 stdin().read_line(&mut id)?;
                 id = id.trim().to_owned();
+                let pw = create_password();
+                let cipher_pw = password_encrypt(&id, &pw, db_pw);
+                match db.add(&id, cipher_pw) {
+                    Ok(_) => {
+                        println!("Your new password is: {}", pw); // TODO: clear screen after showing password
+                        println!("Entry added successfully");
+                    },
+                    Err(_) => {
+                        println!("Entry with id {} already exists", id);
+                    }
+                }
+            }
+            3 => {
+                print!("login: ");
+                stdout().flush().unwrap();
+                let mut id = String::new();
+                stdin().read_line(&mut id)?;
+                id = id.trim().to_owned();
                 match db.get(&id) {
                     Some(enc_pw) => {
                         let dec_pw = password_decrypt(&id, &enc_pw, db_pw);
-                        println!("password: {}", dec_pw);
+                        println!("password: {}", dec_pw); // TODO: clear screen after showing password
                     },
                     None => {
                         println!("Entry not found");
                     }
                 }
             }
-            3 => {
+            4 => {
                 let mut id = String::new();
                 stdin().read_line(&mut id)?;
                 match db.delete(&id) {
@@ -227,7 +139,7 @@ fn db_menu(db: &mut PasswordDatabase, db_pw: &str) -> Result<(), Box<dyn Error>>
                     }
                 }
             }
-            4 => {
+            5 => {
                 let (id, pw) = read_entry()?;
                 let cipher_pw = password_encrypt(&id, &pw, db_pw);
                 match db.edit(&id, cipher_pw) {
@@ -282,9 +194,10 @@ fn read_entry() -> Result<(String, String), Box<dyn Error>> {
 fn menu_string() -> String {
     String::from(
         "1 - Add an entry\r\n\
-         2 - View an entry\r\n\
-         3 - Delete an entry\r\n\
-         4 - Edit an entry\r\n\
+         2 - Add an entry with generated password\r\n\
+         3 - View an entry\r\n\
+         4 - Delete an entry\r\n\
+         5 - Edit an entry\r\n\
          0 - Exit\r\n",
     )
 }
@@ -371,7 +284,7 @@ fn main() {
             let db_password = read_password().unwrap();
             println!("");
 
-            match open_db(db_path, &db_password) {
+            match PasswordDatabase::open_db(db_path, &db_password) {
                 Ok(mut db) => {
                     db_menu(&mut db, &db_password).unwrap();
                 },
